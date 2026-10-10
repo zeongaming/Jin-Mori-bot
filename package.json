@@ -1,0 +1,19 @@
+{
+  "name": "jjs-bot",
+  "version": "1.0.0",
+  "description": "JJS moderation and tryout Discord bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@discordjs/rest": "^2.4.0",
+    "better-sqlite3": "^11.5.0",
+    "discord-api-types": "^0.37.100",
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.5"
+  }
+}

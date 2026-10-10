@@ -1,0 +1,5 @@
+node_modules
+.env
+jjsbot.db
+jjsbot.db-shm
+jjsbot.db-wal
