@@ -1,0 +1,7 @@
+# Pin Node 22 (better-sqlite3 has prebuilt binaries for it) and provide
+# Python + a C/C++ toolchain as a fallback in case it must compile from source.
+[variables]
+NIXPACKS_NODE_VERSION = "22"
+
+[phases.setup]
+nixPkgs = ["...", "python3", "gcc", "gnumake", "pkg-config"]
