@@ -443,6 +443,14 @@ const nukeActionWindows = new Map();
 const channelDeleteWindows = new Map();
 const honeypotAlertCooldowns = new Map();
 
+const EMBED_COLORS = {
+  Blue: 0x3498DB,
+  Green: 0x2ECC71,
+  Red: 0xE74C3C,
+  Gold: 0xF1C40F,
+  Purple: 0x9B59B6
+};
+
 const CATEGORY_CHOICES = [
   { name: "⚖️ Appealable", value: "⚖️ Appealable" },
   { name: "❌ Unappealable", value: "❌ Unappealable" },
@@ -1798,7 +1806,8 @@ function helpEmbed() {
         "**/userinfo** — Shows a member's profile, join date, account age, and roles.",
         "**/autoping** — Enables or disables join pings in a chosen channel.",
         "**/setup** — Opens the bot setup menu.",
-        "**/logs** — Shows recent moderation and security events."
+        "**/logs** — Shows recent moderation and security events.",
+        "**/embed** — Posts a custom embed message in the current channel."
       ].join("\n"),
       inline: false
     },
@@ -2065,6 +2074,8 @@ async function registerCommands() {
       .addSubcommand(subcommand => subcommand.setName("setup").setDescription("Set the channel to monitor").addChannelOption(option => option.setName("channel").setDescription("Channel to monitor").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(true)))
       .addSubcommand(subcommand => subcommand.setName("status").setDescription("Show the current honeypot channel"))
       .addSubcommand(subcommand => subcommand.setName("disable").setDescription("Disable honeypot monitoring")),
+    new SlashCommandBuilder().setName("embed").setDescription("Send a custom embed message in this channel")
+      .addStringOption(option => option.setName("color").setDescription("Color of the embed's side stripe").addChoices(...Object.keys(EMBED_COLORS).map(name => ({ name, value: name })))),
     new SlashCommandBuilder().setName("testsecuritydm").setDescription("Send server administrators a QIRA anti-nuke test DM")
   ];
 
@@ -2081,7 +2092,7 @@ async function registerCommands() {
   // Global registration: commands appear in every server the bot is in,
   // including servers it is invited to later. No per-server work needed.
   await api.put(Routes.applicationCommands(CLIENT_ID), {
-    body: commands.map(command => command.setDMPermission(false).toJSON())
+    body: commands.map(command => (command.name === "embed" ? command.setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages) : command).setDMPermission(false).toJSON())
   });
 
   // Clean up old guild-scoped commands from the single-server version.
@@ -2103,6 +2114,34 @@ client.on("interactionCreate", async interaction => {
 
       if (command === "help") {
         return interaction.reply({ embeds: [helpEmbed()] });
+      }
+
+      if (command === "embed") {
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) {
+          return interaction.reply({ embeds: [errorEmbed("You need the Manage Messages permission to use `/embed`.")], ephemeral: true });
+        }
+
+        const colorName = interaction.options.getString("color") || "Blue";
+        const title = new TextInputBuilder()
+          .setCustomId("embed_title_input")
+          .setLabel("Title")
+          .setStyle(TextInputStyle.Short)
+          .setMaxLength(256)
+          .setRequired(true);
+        const text = new TextInputBuilder()
+          .setCustomId("embed_text_input")
+          .setLabel("Message")
+          .setStyle(TextInputStyle.Paragraph)
+          .setMaxLength(4000)
+          .setRequired(true);
+
+        // The chosen color rides along in the customId so the submit handler can read it.
+        const modal = new ModalBuilder()
+          .setCustomId(`embed_modal:${colorName}`)
+          .setTitle("Create embed")
+          .addComponents(new ActionRowBuilder().addComponents(title), new ActionRowBuilder().addComponents(text));
+
+        return interaction.showModal(modal);
       }
 
       if (command === "serverinfo") {
@@ -3079,6 +3118,27 @@ client.on("interactionCreate", async interaction => {
     }
 
     if (interaction.isModalSubmit()) {
+      if (interaction.customId.startsWith("embed_modal:")) {
+        if (!interaction.guild) return;
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) {
+          return interaction.reply({ embeds: [errorEmbed("You need the Manage Messages permission to use `/embed`.")], ephemeral: true });
+        }
+
+        const colorName = interaction.customId.split(":")[1];
+        const embed = new EmbedBuilder()
+          .setTitle(interaction.fields.getTextInputValue("embed_title_input"))
+          .setDescription(interaction.fields.getTextInputValue("embed_text_input"))
+          .setColor(EMBED_COLORS[colorName] ?? EMBED_COLORS.Blue);
+
+        try {
+          await interaction.channel.send({ embeds: [embed] });
+        } catch (error) {
+          return interaction.reply({ content: "❌ I can't send messages in this channel.", ephemeral: true });
+        }
+
+        return interaction.reply({ content: "✅ Embed sent!", ephemeral: true });
+      }
+
       if (interaction.customId === "setup_appeal_modal") {
         if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
           return interaction.reply({ embeds: [errorEmbed("Only administrators can change setup.")], ephemeral: true });
