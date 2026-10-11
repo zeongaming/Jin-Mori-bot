@@ -32,7 +32,9 @@ require("dotenv").config();
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID;
+// Optional. Only used to remove leftover single-server commands from an older
+// deployment so they don't show up twice next to the global commands.
+const LEGACY_GUILD_ID = process.env.GUILD_ID;
 
 if (!TOKEN || TOKEN.includes("your_")) {
   console.error("❌ DISCORD_TOKEN is missing or still using a placeholder value.");
@@ -41,11 +43,6 @@ if (!TOKEN || TOKEN.includes("your_")) {
 
 if (!CLIENT_ID || CLIENT_ID === "your_discord_application_client_id_here") {
   console.error("❌ CLIENT_ID is missing. Add your Discord application/client ID to .env.");
-  process.exit(1);
-}
-
-if (!GUILD_ID || GUILD_ID === "your_server_id_here") {
-  console.error("❌ GUILD_ID is missing. Add your Discord server ID to .env.");
   process.exit(1);
 }
 
@@ -2081,12 +2078,19 @@ async function registerCommands() {
     const duplicates = commandNames.filter((name, index) => commandNames.indexOf(name) !== index);
     throw new Error(`Duplicate slash command names: ${[...new Set(duplicates)].join(", ")}`);
   }
-  await api.put(Routes.applicationCommands(CLIENT_ID), { body: [] });
-  await api.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
-    body: commands.map(command => command.toJSON())
+  // Global registration: commands appear in every server the bot is in,
+  // including servers it is invited to later. No per-server work needed.
+  await api.put(Routes.applicationCommands(CLIENT_ID), {
+    body: commands.map(command => command.setDMPermission(false).toJSON())
   });
 
-  console.log("✅ Slash commands registered without stale duplicates!");
+  // Clean up old guild-scoped commands from the single-server version.
+  if (LEGACY_GUILD_ID && !LEGACY_GUILD_ID.includes("your_")) {
+    await api.put(Routes.applicationGuildCommands(CLIENT_ID, LEGACY_GUILD_ID), { body: [] })
+      .catch(error => console.warn("Could not clear legacy guild commands:", error.message));
+  }
+
+  console.log(`✅ ${commands.length} global slash commands registered.`);
 }
 
 client.on("interactionCreate", async interaction => {
@@ -3805,8 +3809,19 @@ client.on("guildBanRemove", async (ban) => {
   await logGuildEvent(ban.guild, "✅ Member Unbanned", `${userMention(ban.user.id)} was unbanned.`, 0x5865F2, "bans");
 });
 
+client.on("guildCreate", guild => {
+  ensureSettings(guild.id);
+  console.log(`➕ Joined server: ${guild.name} (${guild.id}) — now in ${client.guilds.cache.size} servers.`);
+});
+
+client.on("guildDelete", guild => {
+  // Data is kept so settings/records survive if the bot is re-invited.
+  console.log(`➖ Left server: ${guild.name || "unknown"} (${guild.id}) — now in ${client.guilds.cache.size} servers.`);
+});
+
 client.once("ready", async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
+  console.log(`✅ Logged in as ${client.user.tag} in ${client.guilds.cache.size} server(s)`);
+  for (const guild of client.guilds.cache.values()) ensureSettings(guild.id);
 
   for (const guild of client.guilds.cache.values()) {
     const botPermissions = guild.members.me?.permissions;

@@ -1,0 +1,6 @@
+DISCORD_TOKEN=your_bot_token
+CLIENT_ID=your_application_id
+DB_PATH=jjsbot.db
+# Optional: only set this if the bot previously ran in a single server and you
+# want its old server-only commands removed (prevents duplicate commands).
+# GUILD_ID=your_old_server_id
