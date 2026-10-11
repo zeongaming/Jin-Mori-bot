@@ -1807,7 +1807,7 @@ function helpEmbed() {
         "**/autoping** — Enables or disables join pings in a chosen channel.",
         "**/setup** — Opens the bot setup menu.",
         "**/logs** — Shows recent moderation and security events.",
-        "**/embed** — Builds a custom embed with fields, buttons, images, and more, or edits one the bot sent."
+        "**/embed** — Opens an interactive embed builder with live preview, fields, buttons, images, and more."
       ].join("\n"),
       inline: false
     },
@@ -2030,7 +2030,7 @@ function resetConfirmRows() {
 }
 
 // ============================================================
-// EMBED BUILDER (/embed) — Discohook-style
+// EMBED BUILDER (/embed) — interactive Discohook-style panel
 // ============================================================
 
 const EMBED_CHANNEL_TYPES = [
@@ -2041,7 +2041,9 @@ const EMBED_CHANNEL_TYPES = [
   ChannelType.AnnouncementThread
 ];
 const EMBED_WEBHOOK_NAME = "JJS Bot Embeds";
-const EMBED_SESSION_TTL_MS = 15 * 60 * 1000;
+const EMBED_SESSION_TTL_MS = 60 * 60 * 1000;
+const EMBED_MAX_TOTAL = 6000;
+const EMBED_HINT = "🛠️ **Embed builder** — use the buttons below to build your message. Your live preview shows up here.";
 const embedSessions = new Map();
 
 function createEmbedSession(data) {
@@ -2050,8 +2052,41 @@ function createEmbedSession(data) {
     if (session.expires <= nowMs) embedSessions.delete(key);
   }
   const token = require("crypto").randomBytes(6).toString("hex");
-  embedSessions.set(token, { ...data, expires: nowMs + EMBED_SESSION_TTL_MS });
-  return token;
+  const session = { token, confirmReset: false, ...data, expires: nowMs + EMBED_SESSION_TTL_MS };
+  embedSessions.set(token, session);
+  return session;
+}
+
+function blankEmbedState() {
+  return {
+    title: null,
+    description: null,
+    url: null,
+    color: EMBED_COLORS.Blue,
+    author: null,
+    footer: null,
+    thumbnail: null,
+    image: null,
+    fields: [],
+    timestamp: false
+  };
+}
+
+function embedStateFromMessage(message) {
+  const e = message.embeds[0]?.toJSON();
+  if (!e) return blankEmbedState();
+  return {
+    title: e.title || null,
+    description: e.description || null,
+    url: e.url || null,
+    color: e.color ?? null,
+    author: e.author ? { name: e.author.name, url: e.author.url || null, iconURL: e.author.icon_url || null } : null,
+    footer: e.footer ? { text: e.footer.text, iconURL: e.footer.icon_url || null } : null,
+    thumbnail: e.thumbnail?.url || null,
+    image: e.image?.url || null,
+    fields: (e.fields || []).map(field => ({ name: field.name, value: field.value, inline: Boolean(field.inline) })),
+    timestamp: Boolean(e.timestamp)
+  };
 }
 
 function isHttpUrl(value) {
@@ -2065,6 +2100,37 @@ function isHttpUrl(value) {
 
 function embedError(message) {
   return { error: message };
+}
+
+function embedStateLength(state) {
+  return (state.title?.length || 0)
+    + (state.description?.length || 0)
+    + (state.author?.name?.length || 0)
+    + (state.footer?.text?.length || 0)
+    + state.fields.reduce((sum, field) => sum + field.name.length + field.value.length, 0);
+}
+
+function validateEmbedState(state) {
+  if (state.fields.length > 25) return "An embed can have at most 25 fields.";
+  if (embedStateLength(state) > EMBED_MAX_TOTAL) return `The embed's text adds up to more than ${EMBED_MAX_TOTAL} characters. Shorten something first.`;
+  return null;
+}
+
+function buildEmbedFromState(state) {
+  const embed = new EmbedBuilder();
+  if (state.title) embed.setTitle(state.title);
+  if (state.description) embed.setDescription(state.description);
+  if (state.title && state.url) embed.setURL(state.url);
+  if (state.color !== null && state.color !== undefined) embed.setColor(state.color);
+  if (state.author?.name) embed.setAuthor({ name: state.author.name, url: state.author.url || undefined, iconURL: state.author.iconURL || undefined });
+  if (state.footer?.text) embed.setFooter({ text: state.footer.text, iconURL: state.footer.iconURL || undefined });
+  if (state.thumbnail) embed.setThumbnail(state.thumbnail);
+  if (state.image) embed.setImage(state.image);
+  if (state.fields.length) embed.addFields(state.fields);
+  if (state.timestamp) embed.setTimestamp();
+
+  const hasEmbed = Boolean(state.title || state.description || state.fields.length || state.author?.name || state.footer?.text || state.thumbnail || state.image);
+  return { embed, hasEmbed };
 }
 
 function parseEmbedFields(text) {
@@ -2094,6 +2160,10 @@ function parseEmbedFields(text) {
   return { fields };
 }
 
+function serializeEmbedFields(fields = []) {
+  return fields.map(field => `${field.name} | ${String(field.value).replace(/\n/g, "\\n")}${field.inline ? " | inline" : ""}`).join("\n");
+}
+
 function parseEmbedButtons(text) {
   const buttons = [];
   const lines = String(text || "").split("\n").map(line => line.trim()).filter(Boolean);
@@ -2104,38 +2174,49 @@ function parseEmbedButtons(text) {
     if (!label || !url) return embedError(`Buttons line ${index + 1} needs the format \`Label | https://link\`.`);
     if (label.length > 80) return embedError(`Button label on line ${index + 1} is over 80 characters.`);
     if (!isHttpUrl(url)) return embedError(`Button link on line ${index + 1} must start with http:// or https://.`);
-    buttons.push(new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(url));
+    buttons.push({ label, url });
   }
 
   if (buttons.length > 25) return embedError("You can add at most 25 buttons.");
-
-  const rows = [];
-  for (let i = 0; i < buttons.length; i += 5) {
-    rows.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
-  }
-  return { rows };
+  return { buttons };
 }
 
-function serializeEmbedFields(fields = []) {
-  return fields.map(field => `${field.name} | ${String(field.value).replace(/\n/g, "\\n")}${field.inline ? " | inline" : ""}`).join("\n");
+function serializeEmbedButtons(buttons = []) {
+  return buttons.map(button => `${button.label} | ${button.url}`).join("\n");
 }
 
-function serializeEmbedButtons(message) {
-  const lines = [];
+function embedButtonsFromMessage(message) {
+  const buttons = [];
   for (const row of message.components || []) {
     for (const component of row.components || []) {
-      if (component.url && component.label) lines.push(`${component.label} | ${component.url}`);
+      if (component.url && component.label) buttons.push({ label: component.label, url: component.url });
     }
   }
-  return lines.join("\n");
+  return buttons;
 }
 
-function embedTotalLength(data) {
-  return (data.title?.length || 0)
-    + (data.description?.length || 0)
-    + (data.author?.name?.length || 0)
-    + (data.footer?.text?.length || 0)
-    + (data.fields || []).reduce((sum, field) => sum + field.name.length + field.value.length, 0);
+function buildEmbedButtonRows(buttons) {
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 5) {
+    rows.push(new ActionRowBuilder().addComponents(
+      buttons.slice(i, i + 5).map(button => new ButtonBuilder().setLabel(button.label).setStyle(ButtonStyle.Link).setURL(button.url))
+    ));
+  }
+  return rows;
+}
+
+function parseEmbedColorInput(input) {
+  const text = String(input || "").trim();
+  const named = Object.keys(EMBED_COLORS).find(name => name.toLowerCase() === text.toLowerCase());
+  if (named) return { value: EMBED_COLORS[named] };
+
+  const cleaned = text.replace(/^#/, "");
+  if (/^[0-9a-f]{6}$/i.test(cleaned)) return { value: parseInt(cleaned, 16) };
+  return embedError(`Use a color name (${Object.keys(EMBED_COLORS).join(", ")}) or a hex code like \`#FF8800\`.`);
+}
+
+function colorToHex(color) {
+  return typeof color === "number" ? `#${color.toString(16).padStart(6, "0").toUpperCase()}` : "";
 }
 
 function parseEmbedMessageRef(input) {
@@ -2153,50 +2234,233 @@ async function getEmbedWebhook(channel) {
   const hooks = await target.fetchWebhooks();
   const existing = hooks.find(hook => hook.owner?.id === client.user.id && hook.name === EMBED_WEBHOOK_NAME);
   if (existing) return existing;
-  return target.createWebhook({ name: EMBED_WEBHOOK_NAME, reason: "Used by /embed for custom name and avatar" });
+  return target.createWebhook({ name: EMBED_WEBHOOK_NAME, reason: "Used by /embed for a custom name and avatar" });
 }
 
-function resolveEmbedColor(colorName, hex) {
-  if (hex) {
-    const cleaned = hex.trim().replace(/^#/, "");
-    if (!/^[0-9a-f]{6}$/i.test(cleaned)) return embedError("`hex` must look like `#FF8800`.");
-    return { value: parseInt(cleaned, 16) };
+// ----- The control panel (live preview + buttons) -----
+
+function embedPanel(session) {
+  const t = session.token;
+  const state = session.embed;
+  const editing = Boolean(session.editMessageId);
+  const { embed, hasEmbed } = buildEmbedFromState(state);
+
+  const button = (action, label, style = ButtonStyle.Secondary) =>
+    new ButtonBuilder().setCustomId(`eb:${t}:${action}`).setLabel(label).setStyle(style);
+
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      button("text", "📝 Message Text"),
+      button("main", "🏷️ Title & Description"),
+      button("author", "👤 Author"),
+      button("footer", "🔻 Footer"),
+      button("images", "🖼️ Images")
+    ),
+    new ActionRowBuilder().addComponents(
+      button("color", "🎨 Color"),
+      button("addfield", "➕ Add Field").setDisabled(state.fields.length >= 25),
+      button("fields", `📋 Fields (${state.fields.length})`),
+      button("buttons", `🔗 Link Buttons (${session.buttons.length})`),
+      button("timestamp", `🕒 Timestamp: ${state.timestamp ? "On" : "Off"}`, state.timestamp ? ButtonStyle.Success : ButtonStyle.Secondary)
+    )
+  ];
+
+  if (!editing) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new ChannelSelectMenuBuilder()
+        .setCustomId(`eb:${t}:channel`)
+        .setPlaceholder("Choose a channel to send to")
+        .addChannelTypes(...EMBED_CHANNEL_TYPES)
+        .setDefaultChannels(session.channelId)
+        .setMinValues(1)
+        .setMaxValues(1)
+    ));
   }
-  if (colorName) return { value: EMBED_COLORS[colorName] };
-  return { value: undefined };
+
+  const lastRow = [button("send", editing ? "💾 Save Changes" : "📤 Send", ButtonStyle.Success)];
+  if (!editing) lastRow.push(button("identity", `🎭 Name & Avatar${session.username || session.avatar ? " ✓" : ""}`));
+  lastRow.push(
+    button("reset", session.confirmReset ? "⚠️ Click again to reset" : "🗑️ Reset", session.confirmReset ? ButtonStyle.Danger : ButtonStyle.Secondary),
+    button("cancel", "✖ Close")
+  );
+  rows.push(new ActionRowBuilder().addComponents(lastRow));
+
+  return {
+    content: session.content || (hasEmbed ? "" : EMBED_HINT),
+    embeds: hasEmbed ? [embed] : [],
+    components: rows,
+    allowedMentions: { parse: [] }
+  };
 }
+
+function embedInput({ id, label, style = TextInputStyle.Short, max, value, placeholder, required = false }) {
+  const builder = new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style).setMaxLength(max).setRequired(required);
+  if (placeholder) builder.setPlaceholder(placeholder);
+  if (value) builder.setValue(String(value).slice(0, max));
+  return new ActionRowBuilder().addComponents(builder);
+}
+
+function embedModal(token, action, title, inputs) {
+  return new ModalBuilder()
+    .setCustomId(`eb:${token}:${action}`)
+    .setTitle(title)
+    .addComponents(...inputs.map(embedInput));
+}
+
+function embedModalFor(session, action) {
+  const t = session.token;
+  const s = session.embed;
+  const P = TextInputStyle.Paragraph;
+
+  switch (action) {
+    case "text":
+      return embedModal(t, "m_text", "Message text", [
+        { id: "content", label: "Text shown above the embed", style: P, max: 2000, value: session.content, placeholder: "Optional. Mentions like @role work here." }
+      ]);
+    case "main":
+      return embedModal(t, "m_main", "Title & description", [
+        { id: "title", label: "Title", max: 256, value: s.title },
+        { id: "description", label: "Description", style: P, max: 4000, value: s.description },
+        { id: "url", label: "Title link (optional)", max: 500, value: s.url, placeholder: "https://example.com" }
+      ]);
+    case "author":
+      return embedModal(t, "m_author", "Author", [
+        { id: "name", label: "Author name", max: 256, value: s.author?.name },
+        { id: "icon", label: "Author icon link (optional)", max: 500, value: s.author?.iconURL },
+        { id: "url", label: "Author link (optional)", max: 500, value: s.author?.url }
+      ]);
+    case "footer":
+      return embedModal(t, "m_footer", "Footer", [
+        { id: "text", label: "Footer text", style: P, max: 2048, value: s.footer?.text },
+        { id: "icon", label: "Footer icon link (optional)", max: 500, value: s.footer?.iconURL }
+      ]);
+    case "images":
+      return embedModal(t, "m_images", "Images", [
+        { id: "thumbnail", label: "Thumbnail link (small, top right)", max: 500, value: s.thumbnail },
+        { id: "image", label: "Image link (large, at the bottom)", max: 500, value: s.image }
+      ]);
+    case "color":
+      return embedModal(t, "m_color", "Embed color", [
+        { id: "color", label: "Color name or hex code", max: 20, value: colorToHex(s.color), required: true, placeholder: `${Object.keys(EMBED_COLORS).join(", ")} or #FF8800` }
+      ]);
+    case "addfield":
+      return embedModal(t, "m_addfield", "Add a field", [
+        { id: "name", label: "Field name", max: 256, required: true },
+        { id: "value", label: "Field value", style: P, max: 1024, required: true },
+        { id: "inline", label: "Show side by side? (yes / no)", max: 5, placeholder: "no" }
+      ]);
+    case "fields":
+      return embedModal(t, "m_fields", "Edit fields", [
+        { id: "fields", label: "One per line: Name | Value | inline", style: P, max: 4000, value: serializeEmbedFields(s.fields), placeholder: "Rules | Be nice\\nBe kind | inline" }
+      ]);
+    case "buttons":
+      return embedModal(t, "m_buttons", "Link buttons", [
+        { id: "buttons", label: "One per line: Label | https://link", style: P, max: 2000, value: serializeEmbedButtons(session.buttons), placeholder: "Join our server | https://discord.gg/example" }
+      ]);
+    case "identity":
+      return embedModal(t, "m_identity", "Custom name & avatar", [
+        { id: "username", label: "Display name (leave empty for the bot)", max: 80, value: session.username },
+        { id: "avatar", label: "Avatar image link", max: 500, value: session.avatar }
+      ]);
+    default:
+      return null;
+  }
+}
+
+// ----- Sending / editing -----
+
+async function sendEmbedSession(interaction, session) {
+  const guild = interaction.guild;
+  const editing = Boolean(session.editMessageId);
+  const problem = message => interaction.followUp({ embeds: [errorEmbed(message)], ephemeral: true });
+
+  await interaction.deferUpdate();
+
+  const channel = await guild.channels.fetch(session.channelId).catch(() => null);
+  if (!channel) return problem("That channel no longer exists.");
+
+  if (!channel.permissionsFor(interaction.member)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
+    return problem(`You can't send messages in ${channel}.`);
+  }
+  const needed = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks];
+  if (channel.isThread()) needed.push(PermissionFlagsBits.SendMessagesInThreads);
+  if (!channel.permissionsFor(guild.members.me)?.has(needed)) {
+    return problem(`I need View Channel, Send Messages, and Embed Links in ${channel}.`);
+  }
+
+  const { embed, hasEmbed } = buildEmbedFromState(session.embed);
+  if (!hasEmbed && !session.content) return problem("Nothing to send yet. Add message text or at least one embed part.");
+
+  const webhookMode = !editing && Boolean(session.username || session.avatar);
+  if (webhookMode) {
+    const parent = channel.isThread() ? channel.parent : channel;
+    if (!parent?.permissionsFor(guild.members.me)?.has(PermissionFlagsBits.ManageWebhooks)) {
+      return problem("I need the Manage Webhooks permission in that channel to use a custom name or avatar.");
+    }
+  }
+
+  const canMentionBroadly = interaction.memberPermissions.has(PermissionFlagsBits.MentionEveryone);
+  const payload = {
+    embeds: hasEmbed ? [embed] : [],
+    components: buildEmbedButtonRows(session.buttons),
+    allowedMentions: { parse: canMentionBroadly ? ["users", "roles", "everyone"] : ["users"] }
+  };
+
+  try {
+    let sent;
+    if (editing) {
+      const target = await channel.messages.fetch(session.editMessageId);
+      if (target.webhookId) {
+        const hook = await target.fetchWebhook();
+        sent = await hook.editMessage(target.id, { ...payload, content: session.content || null, threadId: channel.isThread() ? channel.id : undefined });
+      } else {
+        sent = await target.edit({ ...payload, content: session.content || null });
+      }
+    } else if (webhookMode) {
+      const hook = await getEmbedWebhook(channel);
+      if (!hook) throw new Error("This channel type doesn't support webhooks.");
+      sent = await hook.send({
+        ...payload,
+        content: session.content || undefined,
+        username: session.username || undefined,
+        avatarURL: session.avatar || undefined,
+        threadId: channel.isThread() ? channel.id : undefined
+      });
+    } else {
+      sent = await channel.send({ ...payload, content: session.content || undefined });
+    }
+
+    embedSessions.delete(session.token);
+    addModLog(guild.id, editing ? "embed edit" : "embed", interaction.user.id, interaction.user.id, `${editing ? "Edited" : "Sent"} an embed message in #${channel.name}`);
+
+    const link = `https://discord.com/channels/${guild.id}/${channel.id}/${sent.id}`;
+    return interaction.editReply({ content: `✅ Embed ${editing ? "updated" : "sent"}! ${link}`, embeds: [], components: [] });
+  } catch (error) {
+    console.error("/embed failed:", error);
+    const reason = error?.code === 50013 || error?.code === 50001
+      ? "I'm missing permissions in that channel."
+      : (error?.message || "Unknown error").slice(0, 300);
+    return problem(`Couldn't ${editing ? "edit" : "send"} the embed: ${reason}`);
+  }
+}
+
+// ----- Entry point: /embed -----
 
 async function handleEmbedCommand(interaction) {
   const guild = interaction.guild;
-  const member = interaction.member;
-
-  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) {
-    return interaction.reply({ embeds: [errorEmbed("You need the Manage Messages permission to use `/embed`.")], ephemeral: true });
-  }
-
-  const get = name => interaction.options.getString(name)?.trim() || null;
   const fail = message => interaction.reply({ embeds: [errorEmbed(message)], ephemeral: true });
 
-  // ----- Colors -----
-  const color = resolveEmbedColor(get("color"), get("hex"));
-  if (color.error) return fail(color.error);
-
-  // ----- URLs -----
-  const urlOptions = ["url", "author_url", "author_icon", "footer_icon", "thumbnail", "image", "avatar"];
-  for (const name of urlOptions) {
-    const value = get(name);
-    if (value && !isHttpUrl(value)) return fail(`\`${name}\` must be a valid http(s) link.`);
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) {
+    return fail("You need the Manage Messages permission to use `/embed`.");
   }
 
-  // ----- Editing an existing message? -----
-  let channel = interaction.options.getChannel("channel") || interaction.channel;
+  let channel = interaction.channel;
+  let content = "";
+  let embedState = blankEmbedState();
+  let buttons = [];
   let editTarget = null;
-  let editHook = null;
-  let base = null;
-  let baseContent = "";
-  let baseButtons = "";
 
-  const messageInput = get("message");
+  const messageInput = interaction.options.getString("message")?.trim();
   if (messageInput) {
     const ref = parseEmbedMessageRef(messageInput);
     if (!ref) return fail("`message` must be a message ID or a message link.");
@@ -2211,196 +2475,209 @@ async function handleEmbedCommand(interaction) {
     editTarget = await channel.messages.fetch(ref.messageId).catch(() => null);
     if (!editTarget) return fail("I couldn't find that message. Check the ID, or run the command in the same channel.");
 
-    if (get("username") || get("avatar")) return fail("`username` and `avatar` can only be set when sending a new message.");
-
     if (editTarget.webhookId) {
-      editHook = await editTarget.fetchWebhook().catch(() => null);
-      const ours = editHook && (editHook.applicationId === CLIENT_ID || editHook.owner?.id === client.user.id);
+      const hook = await editTarget.fetchWebhook().catch(() => null);
+      const ours = hook && (hook.applicationId === CLIENT_ID || hook.owner?.id === client.user.id);
       if (!ours) return fail("I can only edit messages that this bot sent.");
     } else if (editTarget.author.id !== client.user.id) {
       return fail("I can only edit messages that this bot sent.");
     }
+    if (editTarget.embeds.length > 1) return fail("That message has more than one embed, which this builder can't edit.");
 
-    base = editTarget.embeds[0]?.toJSON() || null;
-    baseContent = editTarget.content || "";
-    baseButtons = serializeEmbedButtons(editTarget);
+    content = editTarget.content || "";
+    embedState = embedStateFromMessage(editTarget);
+    buttons = embedButtonsFromMessage(editTarget);
   } else if (!EMBED_CHANNEL_TYPES.includes(channel?.type)) {
     return fail("I can only send embeds in text channels, announcement channels, and threads.");
   }
 
-  // ----- Permission checks on the target channel -----
-  const memberPerms = channel.permissionsFor(member);
-  if (!memberPerms?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
+  if (!channel.permissionsFor(interaction.member)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
     return fail(`You can't send messages in ${channel}.`);
   }
-  const botPerms = channel.permissionsFor(guild.members.me);
-  const needed = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks];
-  if (channel.isThread()) needed.push(PermissionFlagsBits.SendMessagesInThreads);
-  if (!botPerms?.has(needed)) {
-    return fail(`I need View Channel, Send Messages, and Embed Links in ${channel}.`);
-  }
 
-  const webhookMode = !editTarget && Boolean(get("username") || get("avatar"));
-  if (webhookMode) {
-    const parentPerms = (channel.isThread() ? channel.parent : channel)?.permissionsFor(guild.members.me);
-    if (!parentPerms?.has(PermissionFlagsBits.ManageWebhooks)) {
-      return fail("I need the Manage Webhooks permission in that channel to use a custom `username` or `avatar`.");
-    }
-  }
-
-  // ----- Author / footer need a name/text -----
-  const author = {
-    name: get("author_name") ?? base?.author?.name ?? null,
-    url: get("author_url") ?? base?.author?.url ?? null,
-    iconURL: get("author_icon") ?? base?.author?.icon_url ?? null
-  };
-  if (!author.name && (get("author_url") || get("author_icon"))) return fail("`author_url` and `author_icon` need an `author_name` too.");
-
-  const footer = {
-    text: get("footer_text") ?? base?.footer?.text ?? null,
-    iconURL: get("footer_icon") ?? base?.footer?.icon_url ?? null
-  };
-  if (!footer.text && get("footer_icon")) return fail("`footer_icon` needs `footer_text` too.");
-
-  const token = createEmbedSession({
+  const session = createEmbedSession({
     userId: interaction.user.id,
     guildId: guild.id,
     channelId: channel.id,
     editMessageId: editTarget?.id || null,
-    webhookMode,
-    username: get("username"),
-    avatar: get("avatar"),
-    base,
-    color: color.value,
-    url: get("url"),
-    author: author.name ? author : null,
-    footer: footer.text ? footer : null,
-    thumbnail: get("thumbnail"),
-    image: get("image"),
-    timestamp: interaction.options.getBoolean("timestamp")
+    content,
+    embed: embedState,
+    buttons,
+    username: null,
+    avatar: null
   });
 
-  const input = (id, label, style, maxLength, value, placeholder) => {
-    const builder = new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style).setMaxLength(maxLength).setRequired(false);
-    if (placeholder) builder.setPlaceholder(placeholder);
-    if (value) builder.setValue(String(value).slice(0, maxLength));
-    return new ActionRowBuilder().addComponents(builder);
-  };
-
-  const modal = new ModalBuilder()
-    .setCustomId(`embed_modal:${token}`)
-    .setTitle(editTarget ? "Edit embed" : "Create embed")
-    .addComponents(
-      input("embed_content_input", "Message text (above the embed)", TextInputStyle.Paragraph, 2000, baseContent, "Optional. Plain text, mentions work here"),
-      input("embed_title_input", "Embed title", TextInputStyle.Short, 256, base?.title),
-      input("embed_text_input", "Embed description", TextInputStyle.Paragraph, 4000, base?.description),
-      input("embed_fields_input", "Fields (Name | Value | inline)", TextInputStyle.Paragraph, 4000, serializeEmbedFields(base?.fields), "One per line. Add | inline to put it side by side"),
-      input("embed_buttons_input", "Link buttons (Label | URL)", TextInputStyle.Paragraph, 2000, baseButtons, "One per line, up to 25")
-    );
-
-  return interaction.showModal(modal);
+  return interaction.reply({ ...embedPanel(session), ephemeral: true });
 }
 
-async function handleEmbedModal(interaction) {
-  const token = interaction.customId.split(":")[1];
-  const session = embedSessions.get(token);
+// ----- Every click / menu / form from the panel lands here (customId "eb:<token>:<action>") -----
 
+async function handleEmbedBuilderInteraction(interaction) {
+  const [, token, action] = interaction.customId.split(":");
   if (!interaction.guild) return;
+
+  const session = embedSessions.get(token);
+  const replyError = message => interaction.reply({ embeds: [errorEmbed(message)], ephemeral: true });
+
   if (!session || session.expires <= Date.now()) {
-    return interaction.reply({ embeds: [errorEmbed("This embed form expired. Run `/embed` again.")], ephemeral: true });
+    embedSessions.delete(token);
+    if (interaction.isMessageComponent()) {
+      return interaction.update({ content: "⌛ This builder expired. Run `/embed` again.", embeds: [], components: [] });
+    }
+    return replyError("This builder expired. Run `/embed` again.");
   }
   if (session.userId !== interaction.user.id || session.guildId !== interaction.guild.id) {
-    return interaction.reply({ embeds: [errorEmbed("This form belongs to someone else.")], ephemeral: true });
+    return replyError("This builder belongs to someone else.");
   }
   if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) {
-    return interaction.reply({ embeds: [errorEmbed("You need the Manage Messages permission to use `/embed`.")], ephemeral: true });
+    return replyError("You need the Manage Messages permission to use `/embed`.");
   }
 
-  const read = id => interaction.fields.getTextInputValue(id).trim();
-  const content = read("embed_content_input");
-  const title = read("embed_title_input");
-  const description = read("embed_text_input");
+  session.expires = Date.now() + EMBED_SESSION_TTL_MS;
+  if (action !== "reset") session.confirmReset = false;
 
-  const parsedFields = parseEmbedFields(read("embed_fields_input"));
-  if (parsedFields.error) return interaction.reply({ embeds: [errorEmbed(parsedFields.error)], ephemeral: true });
-  const parsedButtons = parseEmbedButtons(read("embed_buttons_input"));
-  if (parsedButtons.error) return interaction.reply({ embeds: [errorEmbed(parsedButtons.error)], ephemeral: true });
-
-  // ----- Build the embed -----
-  const embed = session.base ? EmbedBuilder.from(session.base) : new EmbedBuilder();
-  embed.setTitle(title || null).setDescription(description || null).setFields(parsedFields.fields);
-
-  if (session.color !== undefined) embed.setColor(session.color);
-  else if (!session.base) embed.setColor(EMBED_COLORS.Blue);
-
-  if (session.url) embed.setURL(session.url);
-  if (session.author) embed.setAuthor({ name: session.author.name, url: session.author.url || undefined, iconURL: session.author.iconURL || undefined });
-  if (session.footer) embed.setFooter({ text: session.footer.text, iconURL: session.footer.iconURL || undefined });
-  if (session.thumbnail) embed.setThumbnail(session.thumbnail);
-  if (session.image) embed.setImage(session.image);
-  if (session.timestamp === true) embed.setTimestamp();
-  else if (session.timestamp === false) embed.setTimestamp(null);
-
-  const data = embed.toJSON();
-  const hasEmbed = Boolean(data.title || data.description || data.fields?.length || data.author || data.footer || data.image || data.thumbnail);
-
-  if (!hasEmbed && !content) {
-    return interaction.reply({ embeds: [errorEmbed("Nothing to send. Add message text or at least one embed part.")], ephemeral: true });
-  }
-  if (hasEmbed && embedTotalLength(data) > 6000) {
-    return interaction.reply({ embeds: [errorEmbed("The embed's text adds up to more than 6000 characters. Shorten it.")], ephemeral: true });
-  }
-  if (data.url && !data.title) {
-    return interaction.reply({ embeds: [errorEmbed("`url` makes the title a link, so it needs a title.")], ephemeral: true });
-  }
-
-  await interaction.deferReply({ ephemeral: true });
-
-  const channel = await interaction.guild.channels.fetch(session.channelId).catch(() => null);
-  if (!channel) return interaction.editReply({ embeds: [errorEmbed("That channel no longer exists.")] });
-
-  const canMentionBroadly = interaction.memberPermissions.has(PermissionFlagsBits.MentionEveryone);
-  const payload = {
-    embeds: hasEmbed ? [embed] : [],
-    components: parsedButtons.rows,
-    allowedMentions: { parse: canMentionBroadly ? ["users", "roles", "everyone"] : ["users"] }
-  };
-
-  try {
-    let sent;
-    if (session.editMessageId) {
-      const target = await channel.messages.fetch(session.editMessageId);
-      if (target.webhookId) {
-        const hook = await target.fetchWebhook();
-        sent = await hook.editMessage(target.id, { ...payload, content: content || null, threadId: channel.isThread() ? channel.id : undefined });
-      } else {
-        sent = await target.edit({ ...payload, content: content || null });
-      }
-    } else if (session.webhookMode) {
-      const hook = await getEmbedWebhook(channel);
-      if (!hook) throw new Error("This channel type doesn't support webhooks.");
-      sent = await hook.send({
-        ...payload,
-        content: content || undefined,
-        username: session.username || undefined,
-        avatarURL: session.avatar || undefined,
-        threadId: channel.isThread() ? channel.id : undefined
-      });
-    } else {
-      sent = await channel.send({ ...payload, content: content || undefined });
+  // ----- Buttons -----
+  if (interaction.isButton()) {
+    if (action === "timestamp") {
+      session.embed.timestamp = !session.embed.timestamp;
+      return interaction.update(embedPanel(session));
     }
 
-    embedSessions.delete(token);
-    addModLog(interaction.guild.id, session.editMessageId ? "embed edit" : "embed", interaction.user.id, interaction.user.id, `${session.editMessageId ? "Edited" : "Sent"} an embed message in #${channel.name}`);
+    if (action === "reset") {
+      if (!session.confirmReset) {
+        session.confirmReset = true;
+        return interaction.update(embedPanel(session));
+      }
+      session.confirmReset = false;
+      session.content = "";
+      session.embed = blankEmbedState();
+      session.buttons = [];
+      session.username = null;
+      session.avatar = null;
+      return interaction.update(embedPanel(session));
+    }
 
-    const link = `https://discord.com/channels/${interaction.guild.id}/${channel.id}/${sent.id}`;
-    return interaction.editReply({ content: `✅ Embed ${session.editMessageId ? "updated" : "sent"}! ${link}` });
-  } catch (error) {
-    console.error("/embed failed:", error);
-    const reason = error?.code === 50013 || error?.code === 50001
-      ? "I'm missing permissions in that channel."
-      : (error?.message || "Unknown error").slice(0, 300);
-    return interaction.editReply({ embeds: [errorEmbed(`Couldn't ${session.editMessageId ? "edit" : "send"} the embed: ${reason}`)] });
+    if (action === "cancel") {
+      embedSessions.delete(token);
+      return interaction.update({ content: "Closed the embed builder.", embeds: [], components: [] });
+    }
+
+    if (action === "send") return sendEmbedSession(interaction, session);
+
+    const modal = embedModalFor(session, action);
+    if (modal) return interaction.showModal(modal);
+    return interaction.deferUpdate();
+  }
+
+  // ----- Channel picker -----
+  if (interaction.isChannelSelectMenu()) {
+    const picked = await interaction.guild.channels.fetch(interaction.values[0]).catch(() => null);
+    if (!picked || !EMBED_CHANNEL_TYPES.includes(picked.type)) return replyError("I can't send embeds in that channel.");
+    if (!picked.permissionsFor(interaction.member)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
+      return replyError(`You can't send messages in ${picked}.`);
+    }
+    const needed = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks];
+    if (picked.isThread()) needed.push(PermissionFlagsBits.SendMessagesInThreads);
+    if (!picked.permissionsFor(interaction.guild.members.me)?.has(needed)) {
+      return replyError(`I need View Channel, Send Messages, and Embed Links in ${picked}.`);
+    }
+    session.channelId = picked.id;
+    return interaction.update(embedPanel(session));
+  }
+
+  // ----- Forms -----
+  if (interaction.isModalSubmit()) {
+    const read = id => interaction.fields.getTextInputValue(id).trim();
+    const done = () => (interaction.isFromMessage() ? interaction.update(embedPanel(session)) : interaction.reply({ content: "Updated.", ephemeral: true }));
+    const urlProblem = (value, label) => (value && !isHttpUrl(value) ? `${label} must be a valid http(s) link.` : null);
+
+    // Applies a change to a copy of the embed and only keeps it if it's still valid.
+    const commit = mutate => {
+      const next = structuredClone(session.embed);
+      mutate(next);
+      const problem = validateEmbedState(next);
+      if (problem) return problem;
+      session.embed = next;
+      return null;
+    };
+
+    let problem = null;
+
+    switch (action) {
+      case "m_text":
+        session.content = read("content");
+        break;
+
+      case "m_main": {
+        const url = read("url");
+        problem = urlProblem(url, "The title link");
+        if (!problem) problem = commit(e => { e.title = read("title") || null; e.description = read("description") || null; e.url = url || null; });
+        break;
+      }
+
+      case "m_author": {
+        const name = read("name"), icon = read("icon"), url = read("url");
+        problem = urlProblem(icon, "The author icon") || urlProblem(url, "The author link");
+        if (!problem && !name && (icon || url)) problem = "The author icon and link need an author name too.";
+        if (!problem) problem = commit(e => { e.author = name ? { name, iconURL: icon || null, url: url || null } : null; });
+        break;
+      }
+
+      case "m_footer": {
+        const text = read("text"), icon = read("icon");
+        problem = urlProblem(icon, "The footer icon");
+        if (!problem && !text && icon) problem = "The footer icon needs footer text too.";
+        if (!problem) problem = commit(e => { e.footer = text ? { text, iconURL: icon || null } : null; });
+        break;
+      }
+
+      case "m_images": {
+        const thumbnail = read("thumbnail"), image = read("image");
+        problem = urlProblem(thumbnail, "The thumbnail") || urlProblem(image, "The image");
+        if (!problem) problem = commit(e => { e.thumbnail = thumbnail || null; e.image = image || null; });
+        break;
+      }
+
+      case "m_color": {
+        const parsed = parseEmbedColorInput(read("color"));
+        problem = parsed.error || commit(e => { e.color = parsed.value; });
+        break;
+      }
+
+      case "m_addfield": {
+        const name = read("name"), value = read("value");
+        const inline = /^(yes|y|true|1|inline)$/i.test(read("inline"));
+        if (!name || !value) problem = "A field needs both a name and a value.";
+        else problem = commit(e => { e.fields.push({ name, value, inline }); });
+        break;
+      }
+
+      case "m_fields": {
+        const parsed = parseEmbedFields(read("fields"));
+        problem = parsed.error || commit(e => { e.fields = parsed.fields; });
+        break;
+      }
+
+      case "m_buttons": {
+        const parsed = parseEmbedButtons(read("buttons"));
+        problem = parsed.error;
+        if (!problem) session.buttons = parsed.buttons;
+        break;
+      }
+
+      case "m_identity": {
+        const username = read("username"), avatar = read("avatar");
+        problem = urlProblem(avatar, "The avatar");
+        if (!problem) { session.username = username || null; session.avatar = avatar || null; }
+        break;
+      }
+
+      default:
+        return interaction.deferUpdate().catch(() => {});
+    }
+
+    if (problem) return replyError(problem);
+    return done();
   }
 }
 
@@ -2449,22 +2726,8 @@ async function registerCommands() {
       .addSubcommand(subcommand => subcommand.setName("setup").setDescription("Set the channel to monitor").addChannelOption(option => option.setName("channel").setDescription("Channel to monitor").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement).setRequired(true)))
       .addSubcommand(subcommand => subcommand.setName("status").setDescription("Show the current honeypot channel"))
       .addSubcommand(subcommand => subcommand.setName("disable").setDescription("Disable honeypot monitoring")),
-    new SlashCommandBuilder().setName("embed").setDescription("Build and send a custom embed message (or edit one the bot sent)")
-      .addStringOption(option => option.setName("color").setDescription("Preset color of the embed's side stripe").addChoices(...Object.keys(EMBED_COLORS).map(name => ({ name, value: name }))))
-      .addStringOption(option => option.setName("hex").setDescription("Custom color like #FF8800 (overrides color)").setMaxLength(7))
-      .addStringOption(option => option.setName("url").setDescription("Makes the embed title a link"))
-      .addStringOption(option => option.setName("author_name").setDescription("Small author line above the title").setMaxLength(256))
-      .addStringOption(option => option.setName("author_icon").setDescription("Image link for the author icon"))
-      .addStringOption(option => option.setName("author_url").setDescription("Link opened when the author name is clicked"))
-      .addStringOption(option => option.setName("footer_text").setDescription("Footer text at the bottom").setMaxLength(2048))
-      .addStringOption(option => option.setName("footer_icon").setDescription("Image link for the footer icon"))
-      .addStringOption(option => option.setName("thumbnail").setDescription("Small image link shown top-right"))
-      .addStringOption(option => option.setName("image").setDescription("Large image link shown at the bottom"))
-      .addBooleanOption(option => option.setName("timestamp").setDescription("Show the current time in the footer"))
-      .addChannelOption(option => option.setName("channel").setDescription("Channel to send to (default: this channel)").addChannelTypes(...EMBED_CHANNEL_TYPES))
-      .addStringOption(option => option.setName("message").setDescription("Message ID or link to edit (must be one the bot sent)"))
-      .addStringOption(option => option.setName("username").setDescription("Send as a custom name (uses a webhook)").setMaxLength(80))
-      .addStringOption(option => option.setName("avatar").setDescription("Image link for the custom avatar (uses a webhook)")),
+    new SlashCommandBuilder().setName("embed").setDescription("Open the embed builder to create or edit a custom message")
+      .addStringOption(option => option.setName("message").setDescription("Optional: ID or link of a bot message to edit")),
     new SlashCommandBuilder().setName("testsecuritydm").setDescription("Send server administrators a QIRA anti-nuke test DM")
   ];
 
@@ -2495,6 +2758,10 @@ async function registerCommands() {
 
 client.on("interactionCreate", async interaction => {
   try {
+    if (typeof interaction.customId === "string" && interaction.customId.startsWith("eb:")) {
+      return await handleEmbedBuilderInteraction(interaction);
+    }
+
     if (interaction.isChatInputCommand()) {
       const command = interaction.commandName;
       const guild = interaction.guild;
@@ -2506,7 +2773,7 @@ client.on("interactionCreate", async interaction => {
       }
 
       if (command === "embed") {
-        return handleEmbedCommand(interaction);
+        return await handleEmbedCommand(interaction);
       }
 
       if (command === "serverinfo") {
@@ -3483,10 +3750,6 @@ client.on("interactionCreate", async interaction => {
     }
 
     if (interaction.isModalSubmit()) {
-      if (interaction.customId.startsWith("embed_modal:")) {
-        return handleEmbedModal(interaction);
-      }
-
       if (interaction.customId === "setup_appeal_modal") {
         if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
           return interaction.reply({ embeds: [errorEmbed("Only administrators can change setup.")], ephemeral: true });
