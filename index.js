@@ -172,6 +172,15 @@ CREATE TABLE IF NOT EXISTS honeypot_settings (
   guild_id TEXT PRIMARY KEY,
   channel_id TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS temp_bans (
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  moderator_id TEXT NOT NULL,
+  reason TEXT,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY (guild_id, user_id)
+);
 `);
 
 db.exec(`
@@ -255,6 +264,11 @@ const COMMANDS = [
   "deletewarns",
   "kick",
   "ban",
+  "unban",
+  "softban",
+  "massban",
+  "banlist",
+  "baninfo",
   "case",
   "editcase",
   "raid",
@@ -625,6 +639,9 @@ function hasCommandAccess(interactionOrMessage, commandName) {
   }
   if (!allowed.length && ["strike", "strikecheck", "strikelist"].includes(commandName)) {
     return canActivateSecurityCommand(interactionOrMessage.guild, member);
+  }
+  if (!allowed.length && ["ban", "unban", "softban", "massban", "banlist", "baninfo"].includes(commandName)) {
+    return member.permissions?.has(PermissionFlagsBits.BanMembers) || false;
   }
   if (!allowed.length && commandName === "blacklistlist") {
     return member.permissions?.has(PermissionFlagsBits.ModerateMembers) || false;
@@ -1397,14 +1414,122 @@ function createBlacklistListControls(page, pageCount) {
 }
 
 function parseDuration(duration) {
-  const match = /^(\d+)(s|m|h|d)$/i.exec(duration);
+  const match = /^(\d+)(s|m|h|d|w)$/i.exec(duration);
   if (!match) return null;
 
   const amount = Number(match[1]);
   const unit = match[2].toLowerCase();
-  const multipliers = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
+  const multipliers = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 };
 
   return amount * multipliers[unit];
+}
+
+function formatDuration(ms) {
+  const units = [["w", 604800000], ["d", 86400000], ["h", 3600000], ["m", 60000], ["s", 1000]];
+  const parts = [];
+  let remaining = ms;
+  for (const [label, size] of units) {
+    const amount = Math.floor(remaining / size);
+    if (amount > 0) {
+      parts.push(`${amount}${label}`);
+      remaining -= amount * size;
+    }
+    if (parts.length === 2) break;
+  }
+  return parts.join(" ") || "0s";
+}
+
+// ---------- Temporary bans ----------
+
+const TEMP_BAN_MIN_MS = 60 * 1000;
+const TEMP_BAN_CHECK_MS = 30 * 1000;
+let tempBanSweepRunning = false;
+
+function saveTempBan(guildId, userId, moderatorId, reason, expiresAt) {
+  db.prepare(`
+    INSERT INTO temp_bans (guild_id, user_id, moderator_id, reason, expires_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(guild_id, user_id)
+    DO UPDATE SET moderator_id = excluded.moderator_id, reason = excluded.reason, expires_at = excluded.expires_at
+  `).run(guildId, userId, moderatorId, reason || null, expiresAt);
+}
+
+function clearTempBan(guildId, userId) {
+  db.prepare("DELETE FROM temp_bans WHERE guild_id = ? AND user_id = ?").run(guildId, userId);
+}
+
+function getTempBan(guildId, userId) {
+  return db.prepare("SELECT * FROM temp_bans WHERE guild_id = ? AND user_id = ?").get(guildId, userId);
+}
+
+async function sweepExpiredTempBans() {
+  if (tempBanSweepRunning) return;
+  tempBanSweepRunning = true;
+
+  try {
+    const due = db.prepare("SELECT * FROM temp_bans WHERE expires_at <= ?").all(Date.now());
+    for (const row of due) {
+      const guild = client.guilds.cache.get(row.guild_id);
+      if (!guild) continue;
+
+      try {
+        await guild.members.unban(row.user_id, "Temporary ban expired");
+      } catch (error) {
+        // 10026 = Unknown Ban: they were already unbanned by hand, so just clean up.
+        if (error?.code !== 10026) {
+          console.warn(`Could not auto-unban ${row.user_id} in ${guild.name}:`, error.message);
+          continue;
+        }
+      }
+
+      clearTempBan(row.guild_id, row.user_id);
+      addModLog(row.guild_id, "unban", row.user_id, client.user.id, `Temporary ban expired (original reason: ${row.reason || "No reason provided"})`);
+    }
+  } catch (error) {
+    console.error("Temp ban sweep failed:", error);
+  } finally {
+    tempBanSweepRunning = false;
+  }
+}
+
+function startTempBanScheduler() {
+  sweepExpiredTempBans();
+  setInterval(sweepExpiredTempBans, TEMP_BAN_CHECK_MS);
+}
+
+// Parses Dyno-style prefix arguments: <@user|id> [duration] [-s] [-d days] [reason...]
+function parseBanArgs(args) {
+  const tokens = [...args];
+  const result = { target: tokens.shift() || "", durationMs: null, durationText: null, silent: false, deleteDays: 0, reason: "" };
+  const reasonParts = [];
+
+  while (tokens.length) {
+    const token = tokens[0];
+    const lower = token.toLowerCase();
+
+    if (!reasonParts.length && (lower === "-s" || lower === "--silent")) {
+      result.silent = true;
+      tokens.shift();
+    } else if (!reasonParts.length && (lower === "-d" || lower === "--days") && /^\d+$/.test(tokens[1] || "")) {
+      result.deleteDays = Math.min(Number(tokens[1]), 7);
+      tokens.splice(0, 2);
+    } else if (!reasonParts.length && !result.durationMs && parseDuration(token)) {
+      result.durationMs = parseDuration(token);
+      result.durationText = token;
+      tokens.shift();
+    } else {
+      reasonParts.push(...tokens.splice(0));
+    }
+  }
+
+  result.reason = reasonParts.join(" ").slice(0, 400);
+  return result;
+}
+
+async function resolveUserInput(input) {
+  const id = String(input || "").replace(/[<@!>]/g, "").trim();
+  if (!/^\d{17,20}$/.test(id)) return null;
+  return client.users.fetch(id).catch(() => null);
 }
 
 async function doMute(guild, moderator, target, duration, reason) {
@@ -1459,8 +1584,9 @@ async function doUnmute(guild, moderator, target, reason) {
   };
 }
 
-async function doBan(guild, moderator, targetUser, reason, deleteDays = 0, silent = false) {
+async function doBan(guild, moderator, targetUser, reason, deleteDays = 0, silent = false, durationMs = null) {
   if (!targetUser) return { error: "User not found." };
+  if (durationMs !== null && durationMs < TEMP_BAN_MIN_MS) return { error: "A temporary ban must last at least 1 minute." };
   if (targetUser.id === moderator.id) return { error: "You can't ban yourself." };
   if (targetUser.id === client.user.id) return { error: "I can't ban myself." };
   if (targetUser.id === guild.ownerId) return { error: "You can't ban the server owner." };
@@ -1483,10 +1609,15 @@ async function doBan(guild, moderator, targetUser, reason, deleteDays = 0, silen
   let dmSent = false;
   if (member && !silent && !targetUser.bot) {
     const appealLink = getSettings(guild.id).appeal_link;
-    const dmEmbed = publicEmbed("🔨 You Were Banned", `You have been banned from **${guild.name}**.`, 0xED4245).addFields(
+    const dmEmbed = publicEmbed(
+      durationMs ? "⏳ You Were Temporarily Banned" : "🔨 You Were Banned",
+      `You have been ${durationMs ? "temporarily " : ""}banned from **${guild.name}**.`,
+      0xED4245
+    ).addFields(
       { name: "📝 Reason", value: safeText(finalReason) }
     );
-    if (appealLink) dmEmbed.addFields({ name: "📎 Appeal", value: String(appealLink).slice(0, 200) });
+    if (durationMs) dmEmbed.addFields({ name: "⏱️ Duration", value: `${formatDuration(durationMs)} — your ban ends ${`<t:${Math.floor((Date.now() + durationMs) / 1000)}:R>`}` });
+    else if (appealLink) dmEmbed.addFields({ name: "📎 Appeal", value: String(appealLink).slice(0, 200) });
     dmSent = await targetUser.send({ embeds: [dmEmbed] }).then(() => true).catch(() => false);
   }
 
@@ -1500,16 +1631,212 @@ async function doBan(guild, moderator, targetUser, reason, deleteDays = 0, silen
     return { error: "I couldn't ban that user. Check my Ban Members permission and role hierarchy." };
   }
 
-  addModLog(guild.id, "ban", targetUser.id, moderator.id, finalReason);
+  const expiresAt = durationMs ? Date.now() + durationMs : null;
+  if (expiresAt) saveTempBan(guild.id, targetUser.id, moderator.id, finalReason, expiresAt);
+  else clearTempBan(guild.id, targetUser.id);
 
-  const embed = publicEmbed("🔨 User Banned", `${userMention(targetUser.id)} has been banned.`, 0xED4245).addFields(
+  addModLog(guild.id, "ban", targetUser.id, moderator.id, durationMs ? `${finalReason} (temporary: ${formatDuration(durationMs)})` : finalReason);
+
+  const embed = publicEmbed(
+    durationMs ? "⏳ User Temporarily Banned" : "🔨 User Banned",
+    `${userMention(targetUser.id)} has been ${durationMs ? "temporarily " : ""}banned.`,
+    0xED4245
+  ).addFields(
     { name: "👤 User", value: `${userMention(targetUser.id)} (${targetUser.id})`, inline: true },
     { name: "👮 Moderator", value: userMention(moderator.id), inline: true },
-    { name: "🗑️ Messages Deleted", value: days ? `Last ${days} day${days === 1 ? "" : "s"}` : "None", inline: true },
-    { name: "📝 Reason", value: safeText(finalReason) }
+    { name: "🗑️ Messages Deleted", value: days ? `Last ${days} day${days === 1 ? "" : "s"}` : "None", inline: true }
   );
+  if (expiresAt) {
+    embed.addFields(
+      { name: "⏱️ Duration", value: formatDuration(durationMs), inline: true },
+      { name: "🔓 Unbans", value: `<t:${Math.floor(expiresAt / 1000)}:R>`, inline: true }
+    );
+  }
+  embed.addFields({ name: "📝 Reason", value: safeText(finalReason) });
   if (member) embed.setFooter({ text: silent ? "User was not DMed (silent ban)." : dmSent ? "User was notified by DM." : "Couldn't DM the user." });
 
+  return { embed };
+}
+
+async function doUnban(guild, moderator, targetUser, reason) {
+  if (!targetUser) return { error: "User not found." };
+
+  const botMember = guild.members.me;
+  if (!botMember?.permissions.has(PermissionFlagsBits.BanMembers)) return { error: "I need the Ban Members permission." };
+
+  const ban = await guild.bans.fetch(targetUser.id).catch(() => null);
+  if (!ban) return { error: `${userMention(targetUser.id)} is not banned.` };
+
+  const finalReason = reason || "No reason provided";
+  try {
+    await guild.members.unban(targetUser.id, `[${moderator.user.tag}] ${finalReason}`.slice(0, 512));
+  } catch (error) {
+    console.error("Unban failed:", error);
+    return { error: "I couldn't unban that user. Check my Ban Members permission." };
+  }
+
+  clearTempBan(guild.id, targetUser.id);
+  addModLog(guild.id, "unban", targetUser.id, moderator.id, finalReason);
+
+  return {
+    embed: publicEmbed("🔓 User Unbanned", `${userMention(targetUser.id)} has been unbanned.`, 0x57F287).addFields(
+      { name: "👤 User", value: `${userMention(targetUser.id)} (${targetUser.id})`, inline: true },
+      { name: "👮 Moderator", value: userMention(moderator.id), inline: true },
+      { name: "📝 Reason", value: safeText(finalReason) },
+      { name: "📜 Original Ban Reason", value: safeText(ban.reason || "No reason provided") }
+    )
+  };
+}
+
+// Ban then immediately unban so the user's recent messages are wiped but they can rejoin.
+async function doSoftBan(guild, moderator, targetUser, reason, deleteDays = 1) {
+  if (!targetUser) return { error: "User not found." };
+  if (targetUser.id === moderator.id) return { error: "You can't softban yourself." };
+  if (targetUser.id === client.user.id) return { error: "I can't softban myself." };
+  if (targetUser.id === guild.ownerId) return { error: "You can't softban the server owner." };
+
+  const botMember = guild.members.me;
+  if (!botMember?.permissions.has(PermissionFlagsBits.BanMembers)) return { error: "I need the Ban Members permission." };
+
+  const existingBan = await guild.bans.fetch(targetUser.id).catch(() => null);
+  if (existingBan) return { error: `${userMention(targetUser.id)} is already banned.` };
+
+  const member = await guild.members.fetch(targetUser.id).catch(() => null);
+  if (member) {
+    if (!canModerateMember(guild, moderator, member)) return { error: "That user is higher than you in the hierarchy." };
+    if (!member.bannable) return { error: "I can't ban that user. Check my role hierarchy." };
+  }
+
+  const finalReason = reason || "No reason provided";
+  const days = Math.min(Math.max(Number(deleteDays) || 1, 1), 7);
+
+  let dmSent = false;
+  if (member && !targetUser.bot) {
+    dmSent = await targetUser.send({
+      embeds: [publicEmbed("🧹 You Were Softbanned", `You were softbanned from **${guild.name}**. Your recent messages were removed, and you are free to rejoin.`, 0xFEE75C).addFields(
+        { name: "📝 Reason", value: safeText(finalReason) }
+      )]
+    }).then(() => true).catch(() => false);
+  }
+
+  try {
+    await guild.members.ban(targetUser.id, {
+      reason: `[Softban by ${moderator.user.tag}] ${finalReason}`.slice(0, 512),
+      deleteMessageSeconds: days * 86400
+    });
+  } catch (error) {
+    console.error("Softban (ban step) failed:", error);
+    return { error: "I couldn't ban that user. Check my Ban Members permission and role hierarchy." };
+  }
+
+  try {
+    await guild.members.unban(targetUser.id, "Softban: immediate unban");
+  } catch (error) {
+    console.error("Softban (unban step) failed:", error);
+    addModLog(guild.id, "ban", targetUser.id, moderator.id, `Softban left the user banned: ${finalReason}`);
+    return { error: "The user was banned and their messages were deleted, but I couldn't unban them. Please unban them manually with `/unban`." };
+  }
+
+  addModLog(guild.id, "softban", targetUser.id, moderator.id, finalReason);
+
+  const embed = publicEmbed("🧹 User Softbanned", `${userMention(targetUser.id)} was softbanned and can rejoin.`, 0xFEE75C).addFields(
+    { name: "👤 User", value: `${userMention(targetUser.id)} (${targetUser.id})`, inline: true },
+    { name: "👮 Moderator", value: userMention(moderator.id), inline: true },
+    { name: "🗑️ Messages Deleted", value: `Last ${days} day${days === 1 ? "" : "s"}`, inline: true },
+    { name: "📝 Reason", value: safeText(finalReason) }
+  );
+  if (member) embed.setFooter({ text: dmSent ? "User was notified by DM." : "Couldn't DM the user." });
+  return { embed };
+}
+
+const MASSBAN_LIMIT = 25;
+
+async function doMassBan(guild, moderator, idText, reason, deleteDays = 0) {
+  const ids = [...new Set(String(idText || "").split(/[\s,]+/).map(id => id.replace(/[<@!>]/g, "")).filter(Boolean))];
+  if (!ids.length) return { error: "Provide at least one user ID." };
+  if (ids.length > MASSBAN_LIMIT) return { error: `You can ban at most ${MASSBAN_LIMIT} users at once.` };
+
+  const invalid = ids.filter(id => !/^\d{17,20}$/.test(id));
+  if (invalid.length) return { error: `These aren't valid user IDs: ${invalid.slice(0, 5).map(id => `\`${id.slice(0, 25)}\``).join(", ")}` };
+
+  const banned = [];
+  const failed = [];
+  for (const id of ids) {
+    const user = await client.users.fetch(id).catch(() => null);
+    if (!user) {
+      failed.push(`\`${id}\` — user not found`);
+      continue;
+    }
+
+    const result = await doBan(guild, moderator, user, reason, deleteDays, true);
+    if (result.error) failed.push(`${userMention(id)} — ${result.error.replace(/<@!?\d+>/g, "that user")}`);
+    else banned.push(id);
+  }
+
+  const embed = publicEmbed(
+    "🔨 Mass Ban Complete",
+    `**${banned.length}** banned • **${failed.length}** failed`,
+    failed.length ? 0xFEE75C : 0xED4245
+  ).addFields(
+    { name: "👮 Moderator", value: userMention(moderator.id), inline: true },
+    { name: "📝 Reason", value: safeText(reason || "No reason provided") }
+  );
+  if (banned.length) embed.addFields({ name: "✅ Banned", value: safeText(banned.map(userMention).join(" ")).slice(0, 1024) });
+  if (failed.length) embed.addFields({ name: "❌ Failed", value: failed.join("\n").slice(0, 1024) });
+  return { embed };
+}
+
+async function banListEmbed(guild, page = 1) {
+  let bans;
+  try {
+    bans = [...(await guild.bans.fetch()).values()];
+  } catch (error) {
+    console.error("Ban list fetch failed:", error);
+    return { error: "I couldn't fetch the ban list. I need the Ban Members permission." };
+  }
+
+  const pageSize = 10;
+  const pageCount = Math.max(1, Math.ceil(bans.length / pageSize));
+  if (!Number.isInteger(page) || page < 1 || page > pageCount) return { error: `There are ${pageCount} page(s) of bans.` };
+
+  const tempBans = new Map(db.prepare("SELECT user_id, expires_at FROM temp_bans WHERE guild_id = ?").all(guild.id).map(row => [row.user_id, row.expires_at]));
+  const lines = bans.slice((page - 1) * pageSize, page * pageSize).map(ban => {
+    const temp = tempBans.has(ban.user.id) ? ` ⏳ unbans <t:${Math.floor(tempBans.get(ban.user.id) / 1000)}:R>` : "";
+    return `**${safeText(ban.user.username).slice(0, 40)}** (\`${ban.user.id}\`)${temp}\n└ ${safeText(ban.reason || "No reason provided").slice(0, 120)}`;
+  });
+
+  return {
+    embed: publicEmbed("🔨 Server Bans", lines.length ? lines.join("\n") : "Nobody is banned.", 0xED4245)
+      .setFooter({ text: `Page ${page}/${pageCount} • ${bans.length} total ban(s)` })
+  };
+}
+
+async function banInfoEmbed(guild, targetUser) {
+  if (!targetUser) return { error: "User not found." };
+
+  const ban = await guild.bans.fetch(targetUser.id).catch(() => null);
+  if (!ban) return { error: `${userMention(targetUser.id)} is not banned.` };
+
+  const temp = getTempBan(guild.id, targetUser.id);
+  const lastBan = db.prepare(`
+    SELECT moderator_id, created_at
+    FROM moderation
+    WHERE guild_id = ? AND user_id = ? AND action = 'ban'
+    ORDER BY id DESC LIMIT 1
+  `).get(guild.id, targetUser.id);
+
+  const embed = publicEmbed("🔎 Ban Info", `${userMention(targetUser.id)} (${safeText(targetUser.username)})`, 0xED4245)
+    .setThumbnail(targetUser.displayAvatarURL({ size: 128 }))
+    .addFields(
+      { name: "User ID", value: targetUser.id, inline: true },
+      { name: "Type", value: temp ? "⏳ Temporary" : "🔨 Permanent", inline: true },
+      { name: "Reason", value: safeText(ban.reason || "No reason provided") }
+    );
+  if (temp) embed.addFields({ name: "Unbans", value: `<t:${Math.floor(temp.expires_at / 1000)}:F> (<t:${Math.floor(temp.expires_at / 1000)}:R>)`, inline: false });
+  if (lastBan) embed.addFields(
+    { name: "Banned By", value: userMention(lastBan.moderator_id), inline: true },
+    { name: "Date", value: timestamp(lastBan.created_at), inline: true }
+  );
   return { embed };
 }
 
@@ -1873,11 +2200,23 @@ function helpEmbed() {
         "**/warns** — Shows a user's warning history.",
         "**/deletewarns** — Deletes one of a user's warnings.",
         "**/kick** — Kicks a user from the server with a reason.",
-        "**/ban** — Bans a user (even if they're not in the server) with an optional reason and message cleanup of 0-7 days. DMs the user before banning.",
         "**/mute** — Times out a user for a specified duration.",
         "**/unmute** — Removes a timeout from a user.",
         "**/modlogs** — Shows moderation activity for a moderator.",
         "**/purge** — Deletes up to 100 recent messages from this channel."
+      ].join("\n"),
+      inline: false
+    },
+    {
+      name: "Bans",
+      value: [
+        "**/ban** — Bans by mention or user ID (even if they're not in the server). Optional `duration` for a temp ban (e.g. `7d`), `delete_days` (0-7), and `silent` to skip the DM.",
+        "**/unban** — Unbans a user by ID and cancels any temp ban.",
+        "**/softban** — Bans then instantly unbans to wipe recent messages.",
+        "**/massban** — Bans up to 25 user IDs at once.",
+        "**/banlist** — Lists the server's bans, with pages.",
+        "**/baninfo** — Shows the reason, type, and unban time for a banned user.",
+        "Prefix form: `ban <@user|id> [duration] [-s] [-d days] [reason]`"
       ].join("\n"),
       inline: false
     },
@@ -2757,11 +3096,30 @@ async function registerCommands() {
     new SlashCommandBuilder().setName("strikelist").setDescription("List staff with strikes and their count out of 3"),
     new SlashCommandBuilder().setName("deletewarns").setDescription("Delete a warning").addUserOption(option => option.setName("user").setDescription("User").setRequired(true)),
     new SlashCommandBuilder().setName("kick").setDescription("Kick a user").addUserOption(option => option.setName("user").setDescription("User").setRequired(true)).addStringOption(option => option.setName("reason").setDescription("Reason").setRequired(true)),
-    new SlashCommandBuilder().setName("ban").setDescription("Ban a user from the server")
-      .addUserOption(option => option.setName("user").setDescription("User to ban (can be someone not in the server)").setRequired(true))
+    new SlashCommandBuilder().setName("ban").setDescription("Ban a user (by mention or ID), permanently or temporarily")
+      .addUserOption(option => option.setName("user").setDescription("User to ban").setRequired(false))
+      .addStringOption(option => option.setName("user_id").setDescription("Or paste a user ID (works for people not in the server)").setMaxLength(25).setRequired(false))
+      .addStringOption(option => option.setName("duration").setDescription("Temp ban length, e.g. 30m, 12h, 7d, 2w (leave empty for permanent)").setRequired(false))
       .addStringOption(option => option.setName("reason").setDescription("Reason for the ban").setMaxLength(400).setRequired(false))
       .addIntegerOption(option => option.setName("delete_days").setDescription("Delete their messages from the last X days").setMinValue(0).setMaxValue(7).setRequired(false))
       .addBooleanOption(option => option.setName("silent").setDescription("Don't DM the user about the ban").setRequired(false)),
+    new SlashCommandBuilder().setName("unban").setDescription("Unban a user by ID")
+      .addStringOption(option => option.setName("user_id").setDescription("ID of the banned user").setMaxLength(25).setRequired(true))
+      .addStringOption(option => option.setName("reason").setDescription("Reason for the unban").setMaxLength(400).setRequired(false)),
+    new SlashCommandBuilder().setName("softban").setDescription("Ban then immediately unban to delete recent messages")
+      .addUserOption(option => option.setName("user").setDescription("User to softban").setRequired(false))
+      .addStringOption(option => option.setName("user_id").setDescription("Or paste a user ID").setMaxLength(25).setRequired(false))
+      .addStringOption(option => option.setName("reason").setDescription("Reason").setMaxLength(400).setRequired(false))
+      .addIntegerOption(option => option.setName("delete_days").setDescription("Delete their messages from the last X days (default 1)").setMinValue(1).setMaxValue(7).setRequired(false)),
+    new SlashCommandBuilder().setName("massban").setDescription("Ban several users by ID at once")
+      .addStringOption(option => option.setName("user_ids").setDescription(`Up to ${MASSBAN_LIMIT} user IDs separated by spaces or commas`).setMaxLength(1000).setRequired(true))
+      .addStringOption(option => option.setName("reason").setDescription("Reason for the bans").setMaxLength(400).setRequired(false))
+      .addIntegerOption(option => option.setName("delete_days").setDescription("Delete their messages from the last X days").setMinValue(0).setMaxValue(7).setRequired(false)),
+    new SlashCommandBuilder().setName("banlist").setDescription("List the server's bans")
+      .addIntegerOption(option => option.setName("page").setDescription("Page number").setMinValue(1).setRequired(false)),
+    new SlashCommandBuilder().setName("baninfo").setDescription("Show details about a banned user")
+      .addUserOption(option => option.setName("user").setDescription("Banned user").setRequired(false))
+      .addStringOption(option => option.setName("user_id").setDescription("Or paste a user ID").setMaxLength(25).setRequired(false)),
     new SlashCommandBuilder().setName("case").setDescription("View a blacklist case by its sequential number").addIntegerOption(option => option.setName("case").setDescription("Blacklist case number").setMinValue(1).setRequired(true)),
     new SlashCommandBuilder().setName("editcase").setDescription("Edit the reason on a blacklist case").addIntegerOption(option => option.setName("case").setDescription("Blacklist case number").setMinValue(1).setRequired(true)).addStringOption(option => option.setName("reason").setDescription("Updated reason").setMaxLength(1000).setRequired(true)),
     new SlashCommandBuilder().setName("raid").setDescription("Toggle raid protection").addBooleanOption(option => option.setName("enabled").setDescription("Turn raid protection on or off").setRequired(true)),
@@ -3217,16 +3575,99 @@ client.on("interactionCreate", async interaction => {
         }
 
         await interaction.deferReply();
+        const targetUser = interaction.options.getUser("user") || await resolveUserInput(interaction.options.getString("user_id"));
+        if (!targetUser) {
+          return interaction.editReply({ embeds: [errorEmbed("Pick a `user` or paste a valid `user_id`.")] });
+        }
+
+        const durationText = interaction.options.getString("duration")?.trim();
+        let durationMs = null;
+        if (durationText) {
+          durationMs = parseDuration(durationText);
+          if (!durationMs) return interaction.editReply({ embeds: [errorEmbed("Invalid duration. Use `30m`, `12h`, `7d`, `2w`, etc.")] });
+        }
+
         const result = await doBan(
           guild,
           interaction.member,
-          interaction.options.getUser("user", true),
+          targetUser,
           interaction.options.getString("reason"),
           interaction.options.getInteger("delete_days") ?? 0,
-          interaction.options.getBoolean("silent") ?? false
+          interaction.options.getBoolean("silent") ?? false,
+          durationMs
         );
         if (result.error) return interaction.editReply({ embeds: [errorEmbed(result.error)] });
         return interaction.editReply({ embeds: [result.embed] });
+      }
+
+      if (command === "unban") {
+        if (!hasCommandAccess(interaction, "unban")) {
+          return interaction.reply({ embeds: [errorEmbed("You don't have permission to use `/unban`.")], ephemeral: true });
+        }
+
+        await interaction.deferReply();
+        const targetUser = await resolveUserInput(interaction.options.getString("user_id", true));
+        if (!targetUser) return interaction.editReply({ embeds: [errorEmbed("That isn't a valid user ID.")] });
+
+        const result = await doUnban(guild, interaction.member, targetUser, interaction.options.getString("reason"));
+        if (result.error) return interaction.editReply({ embeds: [errorEmbed(result.error)] });
+        return interaction.editReply({ embeds: [result.embed] });
+      }
+
+      if (command === "softban") {
+        if (!hasCommandAccess(interaction, "softban")) {
+          return interaction.reply({ embeds: [errorEmbed("You don't have permission to use `/softban`.")], ephemeral: true });
+        }
+
+        await interaction.deferReply();
+        const targetUser = interaction.options.getUser("user") || await resolveUserInput(interaction.options.getString("user_id"));
+        if (!targetUser) return interaction.editReply({ embeds: [errorEmbed("Pick a `user` or paste a valid `user_id`.")] });
+
+        const result = await doSoftBan(guild, interaction.member, targetUser, interaction.options.getString("reason"), interaction.options.getInteger("delete_days") ?? 1);
+        if (result.error) return interaction.editReply({ embeds: [errorEmbed(result.error)] });
+        return interaction.editReply({ embeds: [result.embed] });
+      }
+
+      if (command === "massban") {
+        if (!hasCommandAccess(interaction, "massban")) {
+          return interaction.reply({ embeds: [errorEmbed("You don't have permission to use `/massban`.")], ephemeral: true });
+        }
+
+        await interaction.deferReply();
+        const result = await doMassBan(
+          guild,
+          interaction.member,
+          interaction.options.getString("user_ids", true),
+          interaction.options.getString("reason"),
+          interaction.options.getInteger("delete_days") ?? 0
+        );
+        if (result.error) return interaction.editReply({ embeds: [errorEmbed(result.error)] });
+        return interaction.editReply({ embeds: [result.embed] });
+      }
+
+      if (command === "banlist") {
+        if (!hasCommandAccess(interaction, "banlist")) {
+          return interaction.reply({ embeds: [errorEmbed("You don't have permission to use `/banlist`.")], ephemeral: true });
+        }
+
+        await interaction.deferReply();
+        const result = await banListEmbed(guild, interaction.options.getInteger("page") ?? 1);
+        if (result.error) return interaction.editReply({ embeds: [errorEmbed(result.error)] });
+        return interaction.editReply({ embeds: [result.embed], allowedMentions: { parse: [] } });
+      }
+
+      if (command === "baninfo") {
+        if (!hasCommandAccess(interaction, "baninfo")) {
+          return interaction.reply({ embeds: [errorEmbed("You don't have permission to use `/baninfo`.")], ephemeral: true });
+        }
+
+        await interaction.deferReply();
+        const targetUser = interaction.options.getUser("user") || await resolveUserInput(interaction.options.getString("user_id"));
+        if (!targetUser) return interaction.editReply({ embeds: [errorEmbed("Pick a `user` or paste a valid `user_id`.")] });
+
+        const result = await banInfoEmbed(guild, targetUser);
+        if (result.error) return interaction.editReply({ embeds: [errorEmbed(result.error)] });
+        return interaction.editReply({ embeds: [result.embed], allowedMentions: { parse: [] } });
       }
 
       if (command === "case") {
@@ -4135,18 +4576,62 @@ client.on("messageCreate", async message => {
   }
 
   if (command === "ban") {
-    const targetId = (message.mentions.users.first()?.id || args[0]?.replace(/[<@!>]/g, "") || "");
-    if (!/^\d{17,20}$/.test(targetId)) {
-      return message.reply({ embeds: [errorEmbed(`Usage: \`${prefix}ban @user|ID [reason]\``)] });
+    const parsed = parseBanArgs(args);
+    const targetUser = await resolveUserInput(parsed.target);
+    if (!targetUser) {
+      return message.reply({ embeds: [errorEmbed(`Usage: \`${prefix}ban <@user|ID> [duration like 7d] [-s] [-d days] [reason]\``)] });
     }
 
-    const targetUser = await client.users.fetch(targetId).catch(() => null);
-    if (!targetUser) return message.reply({ embeds: [errorEmbed("User not found.")] });
-
-    const reason = args.slice(1).join(" ").slice(0, 400);
-    const result = await doBan(message.guild, message.member, targetUser, reason, 0, false);
+    const result = await doBan(message.guild, message.member, targetUser, parsed.reason, parsed.deleteDays, parsed.silent, parsed.durationMs);
     if (result.error) return message.reply({ embeds: [errorEmbed(result.error)] });
     return message.reply({ embeds: [result.embed] });
+  }
+
+  if (command === "unban") {
+    const targetUser = await resolveUserInput(args[0]);
+    if (!targetUser) return message.reply({ embeds: [errorEmbed(`Usage: \`${prefix}unban <ID> [reason]\``)] });
+
+    const result = await doUnban(message.guild, message.member, targetUser, args.slice(1).join(" ").slice(0, 400));
+    if (result.error) return message.reply({ embeds: [errorEmbed(result.error)] });
+    return message.reply({ embeds: [result.embed] });
+  }
+
+  if (command === "softban") {
+    const parsed = parseBanArgs(args);
+    const targetUser = await resolveUserInput(parsed.target);
+    if (!targetUser) return message.reply({ embeds: [errorEmbed(`Usage: \`${prefix}softban <@user|ID> [-d days] [reason]\``)] });
+
+    const result = await doSoftBan(message.guild, message.member, targetUser, parsed.reason, parsed.deleteDays || 1);
+    if (result.error) return message.reply({ embeds: [errorEmbed(result.error)] });
+    return message.reply({ embeds: [result.embed] });
+  }
+
+  if (command === "massban") {
+    // Everything that isn't an ID (or mention) becomes the reason.
+    const isId = token => /^(<@!?)?\d{17,20}>?,?$/.test(token);
+    const firstReasonIndex = args.findIndex(token => !isId(token));
+    const idTokens = firstReasonIndex === -1 ? args : args.slice(0, firstReasonIndex);
+    const reason = firstReasonIndex === -1 ? "" : args.slice(firstReasonIndex).join(" ").slice(0, 400);
+    if (!idTokens.length) return message.reply({ embeds: [errorEmbed(`Usage: \`${prefix}massban <id> <id> ... [reason]\``)] });
+
+    const result = await doMassBan(message.guild, message.member, idTokens.join(" "), reason, 0);
+    if (result.error) return message.reply({ embeds: [errorEmbed(result.error)] });
+    return message.reply({ embeds: [result.embed] });
+  }
+
+  if (command === "banlist") {
+    const result = await banListEmbed(message.guild, Number.parseInt(args[0], 10) || 1);
+    if (result.error) return message.reply({ embeds: [errorEmbed(result.error)] });
+    return message.reply({ embeds: [result.embed], allowedMentions: { parse: [] } });
+  }
+
+  if (command === "baninfo") {
+    const targetUser = await resolveUserInput(args[0]);
+    if (!targetUser) return message.reply({ embeds: [errorEmbed(`Usage: \`${prefix}baninfo <@user|ID>\``)] });
+
+    const result = await banInfoEmbed(message.guild, targetUser);
+    if (result.error) return message.reply({ embeds: [errorEmbed(result.error)] });
+    return message.reply({ embeds: [result.embed], allowedMentions: { parse: [] } });
   }
 
   if (command === "case") {
@@ -4569,6 +5054,7 @@ client.on("guildBanAdd", async (ban) => {
 });
 
 client.on("guildBanRemove", async (ban) => {
+  clearTempBan(ban.guild.id, ban.user.id);
   const settings = getSettings(ban.guild.id);
   if (settings.server_logs_enabled && settings.server_log_channel_id === settings.log_channel_id) return;
   await logGuildEvent(ban.guild, "✅ Member Unbanned", `${userMention(ban.user.id)} was unbanned.`, 0x5865F2, "bans");
@@ -4604,6 +5090,8 @@ client.once("ready", async () => {
   } catch (error) {
     console.error("❌ Command registration failed:", error);
   }
+
+  startTempBanScheduler();
 });
 
 client.login(TOKEN);
