@@ -184,7 +184,7 @@ INSERT OR IGNORE INTO command_roles (guild_id, command_name, role_id)
 SELECT guild_id, 'raid', role_id
 FROM command_roles
 WHERE command_name = 'raidmode';
-DELETE FROM command_roles WHERE command_name IN ('raidmode', 'ban');
+DELETE FROM command_roles WHERE command_name = 'raidmode';
 `);
 
 const blacklistColumns = new Set(db.prepare("PRAGMA table_info(blacklist_records)").all().map(column => column.name));
@@ -254,6 +254,7 @@ const COMMANDS = [
   "strikelist",
   "deletewarns",
   "kick",
+  "ban",
   "case",
   "editcase",
   "raid",
@@ -1458,6 +1459,60 @@ async function doUnmute(guild, moderator, target, reason) {
   };
 }
 
+async function doBan(guild, moderator, targetUser, reason, deleteDays = 0, silent = false) {
+  if (!targetUser) return { error: "User not found." };
+  if (targetUser.id === moderator.id) return { error: "You can't ban yourself." };
+  if (targetUser.id === client.user.id) return { error: "I can't ban myself." };
+  if (targetUser.id === guild.ownerId) return { error: "You can't ban the server owner." };
+
+  const botMember = guild.members.me;
+  if (!botMember?.permissions.has(PermissionFlagsBits.BanMembers)) return { error: "I need the Ban Members permission." };
+
+  const finalReason = reason || "No reason provided";
+  const days = Math.min(Math.max(Number(deleteDays) || 0, 0), 7);
+
+  const existingBan = await guild.bans.fetch(targetUser.id).catch(() => null);
+  if (existingBan) return { error: `${userMention(targetUser.id)} is already banned.` };
+
+  const member = await guild.members.fetch(targetUser.id).catch(() => null);
+  if (member) {
+    if (!canModerateMember(guild, moderator, member)) return { error: "That user is higher than you in the hierarchy." };
+    if (!member.bannable) return { error: "I can't ban that user. Check my role hierarchy." };
+  }
+
+  let dmSent = false;
+  if (member && !silent && !targetUser.bot) {
+    const appealLink = getSettings(guild.id).appeal_link;
+    const dmEmbed = publicEmbed("🔨 You Were Banned", `You have been banned from **${guild.name}**.`, 0xED4245).addFields(
+      { name: "📝 Reason", value: safeText(finalReason) }
+    );
+    if (appealLink) dmEmbed.addFields({ name: "📎 Appeal", value: String(appealLink).slice(0, 200) });
+    dmSent = await targetUser.send({ embeds: [dmEmbed] }).then(() => true).catch(() => false);
+  }
+
+  try {
+    await guild.members.ban(targetUser.id, {
+      reason: `[${moderator.user.tag}] ${finalReason}`.slice(0, 512),
+      deleteMessageSeconds: days * 86400
+    });
+  } catch (error) {
+    console.error("Ban failed:", error);
+    return { error: "I couldn't ban that user. Check my Ban Members permission and role hierarchy." };
+  }
+
+  addModLog(guild.id, "ban", targetUser.id, moderator.id, finalReason);
+
+  const embed = publicEmbed("🔨 User Banned", `${userMention(targetUser.id)} has been banned.`, 0xED4245).addFields(
+    { name: "👤 User", value: `${userMention(targetUser.id)} (${targetUser.id})`, inline: true },
+    { name: "👮 Moderator", value: userMention(moderator.id), inline: true },
+    { name: "🗑️ Messages Deleted", value: days ? `Last ${days} day${days === 1 ? "" : "s"}` : "None", inline: true },
+    { name: "📝 Reason", value: safeText(finalReason) }
+  );
+  if (member) embed.setFooter({ text: silent ? "User was not DMed (silent ban)." : dmSent ? "User was notified by DM." : "Couldn't DM the user." });
+
+  return { embed };
+}
+
 async function doAddRole(guild, moderator, target, role, reason) {
   if (!target) return { error: "User not found." };
   if (!role) return { error: "Role not found." };
@@ -1818,6 +1873,7 @@ function helpEmbed() {
         "**/warns** — Shows a user's warning history.",
         "**/deletewarns** — Deletes one of a user's warnings.",
         "**/kick** — Kicks a user from the server with a reason.",
+        "**/ban** — Bans a user (even if they're not in the server) with an optional reason and message cleanup of 0-7 days. DMs the user before banning.",
         "**/mute** — Times out a user for a specified duration.",
         "**/unmute** — Removes a timeout from a user.",
         "**/modlogs** — Shows moderation activity for a moderator.",
@@ -2701,6 +2757,11 @@ async function registerCommands() {
     new SlashCommandBuilder().setName("strikelist").setDescription("List staff with strikes and their count out of 3"),
     new SlashCommandBuilder().setName("deletewarns").setDescription("Delete a warning").addUserOption(option => option.setName("user").setDescription("User").setRequired(true)),
     new SlashCommandBuilder().setName("kick").setDescription("Kick a user").addUserOption(option => option.setName("user").setDescription("User").setRequired(true)).addStringOption(option => option.setName("reason").setDescription("Reason").setRequired(true)),
+    new SlashCommandBuilder().setName("ban").setDescription("Ban a user from the server")
+      .addUserOption(option => option.setName("user").setDescription("User to ban (can be someone not in the server)").setRequired(true))
+      .addStringOption(option => option.setName("reason").setDescription("Reason for the ban").setMaxLength(400).setRequired(false))
+      .addIntegerOption(option => option.setName("delete_days").setDescription("Delete their messages from the last X days").setMinValue(0).setMaxValue(7).setRequired(false))
+      .addBooleanOption(option => option.setName("silent").setDescription("Don't DM the user about the ban").setRequired(false)),
     new SlashCommandBuilder().setName("case").setDescription("View a blacklist case by its sequential number").addIntegerOption(option => option.setName("case").setDescription("Blacklist case number").setMinValue(1).setRequired(true)),
     new SlashCommandBuilder().setName("editcase").setDescription("Edit the reason on a blacklist case").addIntegerOption(option => option.setName("case").setDescription("Blacklist case number").setMinValue(1).setRequired(true)).addStringOption(option => option.setName("reason").setDescription("Updated reason").setMaxLength(1000).setRequired(true)),
     new SlashCommandBuilder().setName("raid").setDescription("Toggle raid protection").addBooleanOption(option => option.setName("enabled").setDescription("Turn raid protection on or off").setRequired(true)),
@@ -3148,6 +3209,24 @@ client.on("interactionCreate", async interaction => {
           { name: "👮 Moderator", value: userMention(interaction.user.id), inline: true },
           { name: "📝 Reason", value: safeText(reason || "No reason provided") }
         )] });
+      }
+
+      if (command === "ban") {
+        if (!hasCommandAccess(interaction, "ban")) {
+          return interaction.reply({ embeds: [errorEmbed("You don't have permission to use `/ban`.")], ephemeral: true });
+        }
+
+        await interaction.deferReply();
+        const result = await doBan(
+          guild,
+          interaction.member,
+          interaction.options.getUser("user", true),
+          interaction.options.getString("reason"),
+          interaction.options.getInteger("delete_days") ?? 0,
+          interaction.options.getBoolean("silent") ?? false
+        );
+        if (result.error) return interaction.editReply({ embeds: [errorEmbed(result.error)] });
+        return interaction.editReply({ embeds: [result.embed] });
       }
 
       if (command === "case") {
@@ -4053,6 +4132,21 @@ client.on("messageCreate", async message => {
       { name: "👮 Moderator", value: userMention(message.author.id), inline: true },
       { name: "📝 Reason", value: safeText(reason || "No reason provided") }
     )] });
+  }
+
+  if (command === "ban") {
+    const targetId = (message.mentions.users.first()?.id || args[0]?.replace(/[<@!>]/g, "") || "");
+    if (!/^\d{17,20}$/.test(targetId)) {
+      return message.reply({ embeds: [errorEmbed(`Usage: \`${prefix}ban @user|ID [reason]\``)] });
+    }
+
+    const targetUser = await client.users.fetch(targetId).catch(() => null);
+    if (!targetUser) return message.reply({ embeds: [errorEmbed("User not found.")] });
+
+    const reason = args.slice(1).join(" ").slice(0, 400);
+    const result = await doBan(message.guild, message.member, targetUser, reason, 0, false);
+    if (result.error) return message.reply({ embeds: [errorEmbed(result.error)] });
+    return message.reply({ embeds: [result.embed] });
   }
 
   if (command === "case") {
